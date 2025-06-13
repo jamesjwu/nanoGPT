@@ -72,6 +72,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+package = ""
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -205,7 +206,20 @@ checkpoint = None # free up memory
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    if package == "save":
+        torch._functorch.config.bundled_autograd_cache = True
+        torch._functorch.config.strict_autograd_cache = True
+        import torch._dynamo.package
+
+        def guard_filter_fn(guards):
+            return [False for g in guards]  # Drop all guards.
+            # return [g.guard_type not in ("FUNCTION_MATCH", "BUILTIN_MATCH", "DUPLICATE_INPUT") for g in guards]
+        model = torch._dynamo.optimize(
+            package=torch._dynamo.package.CompilePackage(model.forward),
+            guard_filter_fn=guard_filter_fn
+        )(model)
+    else:
+        model = torch.compile(model) # requires PyTorch 2.0
 
 # wrap model into DDP container
 if ddp:
@@ -284,6 +298,8 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                if compile and package == "save":
+                    model.save_package("/tmp/nanogpt_package/")
     if iter_num == 0 and eval_only:
         break
 
