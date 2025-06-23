@@ -206,10 +206,10 @@ checkpoint = None # free up memory
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
+    import torch._dynamo.package
     if package == "save":
         torch._functorch.config.bundled_autograd_cache = True
         torch._functorch.config.strict_autograd_cache = True
-        import torch._dynamo.package
 
         def guard_filter_fn(guards):
             return [False for g in guards]  # Drop all guards.
@@ -218,6 +218,16 @@ if compile:
             package=torch._dynamo.package.CompilePackage(model.forward),
             guard_filter_fn=guard_filter_fn
         )(model)
+    elif package:
+        torch._functorch.config.bundled_autograd_cache = True
+        torch._functorch.config.strict_autograd_cache = True
+        def guard_filter_fn(guards):
+            return [False for g in guards]  # Drop all guards.
+        model = torch._dynamo.optimize(
+            package=None,
+            guard_filter_fn=guard_filter_fn
+    )(model)
+        model.load_package(package)
     else:
         model = torch.compile(model) # requires PyTorch 2.0
 
@@ -228,18 +238,19 @@ if ddp:
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
+    with torch.compiler.set_stance("fail_on_recompile"):
+        out = {}
+        model.eval()
+        for split in ['train', 'val']:
+            losses = torch.zeros(eval_iters)
+            for k in range(eval_iters):
+                X, Y = get_batch(split)
+                with ctx:
+                    logits, loss = model(X, Y)
+                losses[k] = loss.item()
+            out[split] = losses.mean()
+        model.train()
+        return out
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -300,6 +311,7 @@ while True:
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
                 if compile and package == "save":
                     model.save_package("/tmp/nanogpt_package/")
+
     if iter_num == 0 and eval_only:
         break
 
